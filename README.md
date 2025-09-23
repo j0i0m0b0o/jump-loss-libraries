@@ -25,7 +25,6 @@ Self‑contained background workers that compute a “simple” jump‑loss esti
 - EMA coefficient is derived from half‑life:
   - `alpha = 1 − 2^(−Δ / T½)`
 - Default alpha at 160 ms / 4.8 s is ≈ 0.0231
-- No clamp/cap is applied to JL (intentionally differs from the UI’s optional clamp).
 
 ---
 
