@@ -1,0 +1,14 @@
+[package]
+name = "jumploss-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+url = "2"
+tungstenite = { version = "0.21", default-features = false }
