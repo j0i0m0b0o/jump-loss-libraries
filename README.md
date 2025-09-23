@@ -11,6 +11,8 @@ Self‑contained background workers that compute a “simple” jump‑loss esti
 - Inputs: `F` is the oracle fee in “thousandths of a basis point” (contract units). Example: `5000 → 0.05%`.
 - Reconnects: Exponential backoff with jitter; state persists across reconnects.
 
+  **FOR BOT USERS: dispute jump loss in $ can be approximated with JL * (newAmount1ToUsd + newAmount2ToUsd). can plug this directly into dispute EV logic.**
+
 ## Layout
 
 - `jumplossPython.py` — Python CLI tool
