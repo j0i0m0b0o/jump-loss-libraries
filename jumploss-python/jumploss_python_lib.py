@@ -30,7 +30,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, List, Tuple
 
 import websockets
 import websockets.exceptions
@@ -75,11 +75,14 @@ class JumpLossWorker:
         self.updates = thread_queue.Queue(maxsize=1024)  # thread-safe for consumers
 
         # mutable state for worker
+        self._lock = threading.Lock()
         self._mean_tick_jump_ema = 0.0
         self._bucket_start_price: Optional[float] = None
         self._bucket_last_price: Optional[float] = None
         self._bucket_count = 0
         self._last_print = 0.0
+        # ring buffer of (ts_ms, r_percent), keep ~10 minutes
+        self._returns: List[Tuple[int, float]] = []
 
     def start_background(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -127,11 +130,12 @@ class JumpLossWorker:
                             if bid <= 0 or ask <= 0:
                                 continue
                             mid = (bid + ask) / 2.0
-                            if self._bucket_start_price is None or self._bucket_last_price is None:
-                                self._bucket_start_price = mid
-                                self._bucket_last_price = mid
-                            else:
-                                self._bucket_last_price = mid
+                            with self._lock:
+                                if self._bucket_start_price is None or self._bucket_last_price is None:
+                                    self._bucket_start_price = mid
+                                    self._bucket_last_price = mid
+                                else:
+                                    self._bucket_last_price = mid
                     finally:
                         bucket_task.cancel()
                         with contextlib_suppress():
@@ -155,29 +159,48 @@ class JumpLossWorker:
     async def _bucket_finalizer(self) -> None:
         while not self._stop_evt.is_set():
             await asyncio.sleep(self.bucket_ms / 1000.0)
-            if self._bucket_start_price is None or self._bucket_last_price is None:
+            with self._lock:
+                start = self._bucket_start_price
+                last = self._bucket_last_price
+            if start is None or last is None:
                 continue
-            start = self._bucket_start_price
-            last = self._bucket_last_price
             try:
                 r160 = 100.0 * abs(math.log(last / start))
             except Exception:
                 r160 = 0.0
-            self._mean_tick_jump_ema = self._alpha * r160 + (1 - self._alpha) * self._mean_tick_jump_ema
-            self._bucket_count += 1
-            # start next bucket from last
-            self._bucket_start_price = last
+            with self._lock:
+                self._mean_tick_jump_ema = self._alpha * r160 + (1 - self._alpha) * self._mean_tick_jump_ema
+                self._bucket_count += 1
+                # start next bucket from last
+                self._bucket_start_price = last
+                # append to ring and prune to ~10 minutes
+                ts_ms = int(time.time() * 1000)
+                self._returns.append((ts_ms, r160))
+                cutoff = ts_ms - 600_000
+                # prune from front
+                # keep last ~10 minutes; list sizes here are small (~3750)
+                idx = 0
+                for i, (t, _) in enumerate(self._returns):
+                    if t < cutoff:
+                        idx = i + 1
+                    else:
+                        break
+                if idx > 0:
+                    self._returns = self._returns[idx:]
 
             # publish update (>= min buckets, at most 1Hz)
             now = time.time()
-            if self._bucket_count >= MIN_BUCKETS and (now - self._last_print) > 1.0:
-                jl = simple_jump_loss(self._mean_tick_jump_ema, self.f_percent)
+            with self._lock:
+                bc = self._bucket_count
+                mu = self._mean_tick_jump_ema
+            if bc >= MIN_BUCKETS and (now - self._last_print) > 1.0:
+                jl = simple_jump_loss(mu, self.f_percent)
                 update = JumpLossUpdate(
                     timestamp=now,
-                    mu_j_percent=self._mean_tick_jump_ema,
+                    mu_j_percent=mu,
                     jl_percent=jl,
                     f_percent=self.f_percent,
-                    bucket_count=self._bucket_count,
+                    bucket_count=bc,
                 )
                 try:
                     if self.on_update:
@@ -186,6 +209,26 @@ class JumpLossWorker:
                 except Exception:
                     pass
                 self._last_print = now
+
+    def request_jumploss(self, fee_units: int, settlement_time: int, time_type_seconds: bool) -> JumpLossUpdate:
+        """Compute dynamic μ_J and JL for a given horizon on demand.
+        - Half-life = settlement_time/2 seconds; in blocks mode, 2s/block -> HL seconds = blocks.
+        Returns a JumpLossUpdate snapshot (timestamp now).
+        """
+        f_pct = units_to_percent(int(fee_units))
+        if time_type_seconds:
+            hl_ms = max(1, int(settlement_time) * 1000 // 2)
+        else:
+            hl_ms = max(1, int(settlement_time) * 2000 // 2)
+        alpha = 1.0 - pow(2.0, -float(self.bucket_ms) / float(hl_ms))
+        with self._lock:
+            rets = list(self._returns)
+            bc = self._bucket_count
+        acc = 0.0
+        for _, r in rets:
+            acc = alpha * r + (1.0 - alpha) * acc
+        jl = simple_jump_loss(acc, f_pct)
+        return JumpLossUpdate(timestamp=time.time(), mu_j_percent=acc, jl_percent=jl, f_percent=f_pct, bucket_count=bc)
 
 
 class contextlib_suppress:

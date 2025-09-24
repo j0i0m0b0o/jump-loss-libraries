@@ -1,164 +1,32 @@
 #!/usr/bin/env python3
 """
-Simple Jump Loss (Python)
+Simple Jump Loss (Python CLI)
 
-Run: python3 jumplossPython.py 5000
- - Argument is oracle fee in thousandths of a basis point (same units as the contract).
- - Example 5000 -> F = 0.05% (5 bps).
+Usage:
+  python3 jumplossPython.py <fee_units> [--seconds N | --blocks N]
 
-This script connects to Coinbase ETH-USD ticker, forms 160ms buckets of mid-price
-changes, maintains an EMA of absolute bucket returns (μ_J in percent), and computes
-the simple jump loss using the piecewise rule WITHOUT clamping:
+  <fee_units>: thousandths-of-basis-points (e.g., 5000 -> 0.05%)
+  --seconds N: dynamic half-life tied to N seconds (HL = N/2)
+  --blocks N : dynamic half-life tied to N blocks (2s/block; HL = blocks)
 
-  if μ_J > F:   JL = μ_J - F/2
-  else:         JL = μ_J / 2
-
-No additional clamp to [0, μ_J] and no 0.5% cap are applied.
+Without flags, prints the default stream (HL=4800ms). With flags, prints dynamic JL once per second,
+and supports live updates via stdin lines like "seconds 12" or "blocks 6".
 """
-
 import sys
-import json
-import math
 import time
-import asyncio
-import random
-import websockets
-import websockets.exceptions
+import threading
+from typing import Optional
 
-COINBASE_WS = "wss://ws-feed.exchange.coinbase.com"
-
-# 160ms buckets and EMA config (matches UI logic)
-BUCKET_MS = 160
-ALPHA_160MS = 0.0231  # ~30-bucket half-life
-MIN_BUCKETS = 5       # must accumulate before reporting
+from jumploss_python_lib import JumpLossWorker
 
 
-def units_to_percent(units: int) -> float:
-    """Convert thousandths-of-basis-points to percent.
-    Example: 5000 -> 0.05%.
-    Contract precision is 1e7, so: percent = (units / 1e7) * 100.
-    """
-    return (units / 1e7) * 100.0
-
-
-def simple_jump_loss(muJ_percent: float, F_percent: float) -> float:
-    """Piecewise jump loss WITHOUT clamping/capping."""
-    if muJ_percent > F_percent:
-        return muJ_percent - (F_percent / 2.0)
-    else:
-        return muJ_percent / 2.0
-
-
-async def run(F_units: int):
-    F_percent = units_to_percent(F_units)
-    print(f"📈 Using barrier F = {F_percent:.6f}% (from {F_units} units)")
-
-    mean_tick_jump_ema = 0.0  # μ_J (percent)
-    bucket_start_time = None
-    bucket_start_price = None
-    bucket_last_price = None
-    bucket_count = 0
-    last_print = 0.0
-
-    attempt = 0  # reconnection attempt counter for exponential backoff
-    while True:
-        try:
-            print("📡 Connecting to Coinbase ticker (ETH-USD)...")
-            async with websockets.connect(COINBASE_WS, ping_interval=20, ping_timeout=10, close_timeout=10) as ws:
-                # Subscribe
-                sub = {
-                    "type": "subscribe",
-                    "product_ids": ["ETH-USD"],
-                    "channels": ["ticker"],
-                }
-                await ws.send(json.dumps(sub))
-                print("✅ Subscribed to ETH-USD ticker")
-                # Reset backoff on successful connection
-                attempt = 0
-
-                # Periodic bucket finalizer
-                async def bucket_task():
-                    nonlocal mean_tick_jump_ema, bucket_start_time, bucket_start_price, bucket_last_price, bucket_count, last_print
-                    while True:
-                        await asyncio.sleep(BUCKET_MS / 1000.0)
-                        now_ms = int(time.time() * 1000)
-                        if (
-                            bucket_start_time is not None
-                            and bucket_start_price is not None
-                            and bucket_last_price is not None
-                            and (now_ms - bucket_start_time) >= BUCKET_MS
-                        ):
-                            try:
-                                r160 = 100.0 * abs(math.log(bucket_last_price / bucket_start_price))
-                            except Exception:
-                                r160 = 0.0
-                            # Update EMA
-                            mean_tick_jump_ema = ALPHA_160MS * r160 + (1 - ALPHA_160MS) * mean_tick_jump_ema
-                            bucket_count += 1
-
-                            # Start next bucket from last price
-                            bucket_start_time = now_ms
-                            bucket_start_price = bucket_last_price
-
-                            # Print periodic status
-                            if bucket_count >= MIN_BUCKETS and (time.time() - last_print > 1.0):
-                                JL = simple_jump_loss(mean_tick_jump_ema, F_percent)
-                                print(
-                                    f"JL(simple,no-clamp): μ_J={mean_tick_jump_ema:.6f}%  F={F_percent:.6f}%  JL={JL:.6f}%  buckets={bucket_count}"
-                                )
-                                last_print = time.time()
-
-                bucket_task_handle = asyncio.create_task(bucket_task())
-
-                try:
-                    while True:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                        data = json.loads(msg)
-                        if data.get("type") != "ticker" or data.get("product_id") != "ETH-USD":
-                            continue
-                        bid = float(data.get("best_bid", 0) or 0)
-                        ask = float(data.get("best_ask", 0) or 0)
-                        if bid <= 0 or ask <= 0:
-                            continue
-                        mid = (bid + ask) / 2.0
-
-                        now_ms = int(time.time() * 1000)
-                        if bucket_start_time is None or bucket_start_price is None:
-                            bucket_start_time = now_ms
-                            bucket_start_price = mid
-                            bucket_last_price = mid
-                        else:
-                            bucket_last_price = mid
-                finally:
-                    bucket_task_handle.cancel()
-                    try:
-                        await bucket_task_handle
-                    except:
-                        pass
-
-        except (asyncio.TimeoutError,
-                websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.ConnectionClosedOK,
-                websockets.exceptions.ConnectionClosedError) as e:
-            attempt += 1
-            delay = min(60, 2 ** attempt)
-            jitter = random.uniform(0.5, 1.5)
-            sleep_s = delay * jitter
-            print(f"⚠️ Connection issue ({type(e).__name__}), reconnecting in {sleep_s:.1f}s (attempt {attempt})")
-            await asyncio.sleep(sleep_s)
-        except Exception as e:
-            attempt += 1
-            delay = min(60, 2 ** attempt)
-            jitter = random.uniform(0.5, 1.5)
-            sleep_s = delay * jitter
-            print(f"⚠️ Coinbase error: {e}, reconnecting in {sleep_s:.1f}s (attempt {attempt})")
-            await asyncio.sleep(sleep_s)
+def usage():
+    print("Usage:\n  python3 jumplossPython.py <fee_units> [--seconds N | --blocks N]")
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 jumplossPython.py <fee_units>")
-        print(" - <fee_units>: thousandths-of-basis-points (e.g., 5000 -> 0.05%)")
+        usage()
         sys.exit(1)
     try:
         fee_units = int(sys.argv[1])
@@ -166,7 +34,79 @@ def main():
         print("Invalid fee_units; must be integer")
         sys.exit(1)
 
-    asyncio.run(run(fee_units))
+    # parse optional dynamic mode
+    dynamic = False
+    time_type_sec: Optional[bool] = None
+    st: Optional[int] = None
+    if len(sys.argv) >= 4:
+        flag = sys.argv[2]
+        if flag in ("--seconds", "-s"):
+            time_type_sec = True
+            st = int(sys.argv[3])
+            dynamic = True
+        elif flag in ("--blocks", "-b"):
+            time_type_sec = False
+            st = int(sys.argv[3])
+            dynamic = True
+        else:
+            print("Unknown flag:", flag)
+            usage()
+            sys.exit(1)
+
+    jl = JumpLossWorker(fee_units=fee_units)
+    jl.start_background()
+
+    if dynamic:
+        # live input thread to update settlement horizon
+        def stdin_loop():
+            nonlocal time_type_sec, st
+            try:
+                for line in sys.stdin:
+                    parts = line.strip().split()
+                    if len(parts) == 2:
+                        key, val = parts[0].lower(), parts[1]
+                        try:
+                            n = int(val)
+                        except ValueError:
+                            continue
+                        if key in ("seconds", "sec", "s"):
+                            time_type_sec = True
+                            st = n
+                        elif key in ("blocks", "blk", "b"):
+                            time_type_sec = False
+                            st = n
+            except Exception:
+                pass
+
+        threading.Thread(target=stdin_loop, daemon=True).start()
+
+        try:
+            while True:
+                time.sleep(1)
+                if st is None or time_type_sec is None:
+                    continue
+                upd = jl.request_jumploss(fee_units=fee_units, settlement_time=st, time_type_seconds=time_type_sec)
+                hl_sec = (st // 2) if time_type_sec else st
+                print(
+                    f"JL(dynamic HL, HL={hl_sec}s): μ_J={upd.mu_j_percent:.6f}%  F={upd.f_percent:.6f}%  JL={upd.jl_percent:.6f}%  buckets={upd.bucket_count}"
+                )
+        except KeyboardInterrupt:
+            pass
+        finally:
+            jl.stop()
+        return
+
+    # default stream: print updates from queue
+    try:
+        while True:
+            upd = jl.updates.get()
+            print(
+                f"JL(simple,no-clamp): μ_J={upd.mu_j_percent:.6f}%  F={upd.f_percent:.6f}%  JL={upd.jl_percent:.6f}%  buckets={upd.bucket_count}"
+            )
+    except KeyboardInterrupt:
+        pass
+    finally:
+        jl.stop()
 
 
 if __name__ == "__main__":
