@@ -90,8 +90,22 @@ func main() {
                 return
             case <-ticker.C:
                 resp := make(chan jumploss.Update, 1)
-                h.Query <- jumploss.Query{ FeeUnits: feeUnits, SettlementTime: st, TimeTypeSec: stType, Resp: resp }
-                upd := <-resp
+                // send query or exit on cancel
+                select {
+                case h.Query <- jumploss.Query{ FeeUnits: feeUnits, SettlementTime: st, TimeTypeSec: stType, Resp: resp }:
+                case <-ctx.Done():
+                    return
+                }
+                // wait for response, cancel, or timeout
+                var upd jumploss.Update
+                select {
+                case upd = <-resp:
+                case <-ctx.Done():
+                    return
+                case <-time.After(2 * time.Second):
+                    // skip this tick if no response
+                    continue
+                }
                 var hlSec uint64
                 if stType { hlSec = st / 2 } else { hlSec = st }
                 fmt.Printf("JL(dynamic HL, HL=%ds): μ_J=%.6f%%  F=%.6f%%  JL=%.6f%%  buckets=%d\n",
