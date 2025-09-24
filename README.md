@@ -11,7 +11,7 @@ Self‑contained background workers that compute a “simple” jump‑loss esti
 - Inputs: `F` is the oracle fee in “thousandths of a basis point” (contract units). Example: `5000 → 0.05%`.
 - Reconnects: Exponential backoff with jitter; state persists across reconnects.
 
-  Dispute/initial jump loss in $ can be approximated as `JL * (USD(amount1) + USD(amount2))`.
+  Dispute & initial report jump loss in $ can be approximated as `JL * (USD(newAmount1) + USD(newAmount2))`.
 
 ### Highlights
 - Dynamic half‑life: `HL = settlementTime / 2` seconds. For block mode on Base (2s/block), `HL seconds = blocks`.
