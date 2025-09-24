@@ -11,7 +11,16 @@ Self‑contained background workers that compute a “simple” jump‑loss esti
 - Inputs: `F` is the oracle fee in “thousandths of a basis point” (contract units). Example: `5000 → 0.05%`.
 - Reconnects: Exponential backoff with jitter; state persists across reconnects.
 
-  **FOR BOT USERS: dispute / initial report jump loss in $ can be approximated with JL * (newAmount1ToUsd + newAmount2ToUsd). can plug this directly into dispute and initial report EV logic.**
+  Dispute/initial jump loss in $ can be approximated as `JL * (USD(amount1) + USD(amount2))`.
+
+### Highlights
+- Dynamic half‑life: `HL = settlementTime / 2` seconds. For block mode on Base (2s/block), `HL seconds = blocks`.
+- On‑demand JL (in‑memory 160ms return buffer):
+  - Rust: `handle.request_jumploss(fee_units, settlement_time, time_type)`
+  - Go: send `Query{FeeUnits, SettlementTime, TimeTypeSec}` to `Handle.Query`
+  - Python: `JumpLossWorker.request_jumploss(...)`
+- CLI live control (Rust/Go): run with `--seconds N` or `--blocks N`, then update at runtime via stdin (`seconds 20`, `blocks 8`).
+- No persistence: ~10 minutes of 160ms returns kept in RAM for dynamic recompute.
 
 ## Layout
 
