@@ -199,6 +199,8 @@ func bucketLoop(ctx context.Context, st *state, F float64, out chan<- Update, cf
         case <-t.C:
         }
         st.mu.Lock()
+        var emit bool
+        var upd Update
         if st.bucketStartPrice != nil && st.bucketLastPrice != nil {
             start, last := *st.bucketStartPrice, *st.bucketLastPrice
             r := math.Abs(math.Log(last/start)) * 100.0
@@ -219,11 +221,19 @@ func bucketLoop(ctx context.Context, st *state, F float64, out chan<- Update, cf
             }
             if st.bucketCount >= minBuckets && (lastEmit.IsZero() || time.Since(lastEmit) >= time.Second) {
                 jl := simpleJumpLoss(st.muJPercent, F)
-                out <- Update{ Time: time.Now(), MuJPercent: st.muJPercent, JLPercent: jl, FPercent: F, BucketCount: st.bucketCount }
+                upd = Update{ Time: time.Now(), MuJPercent: st.muJPercent, JLPercent: jl, FPercent: F, BucketCount: st.bucketCount }
+                emit = true
                 lastEmit = time.Now()
             }
         }
         st.mu.Unlock()
+        if emit {
+            select {
+            case out <- upd:
+            default:
+                // drop if no consumer to avoid blocking
+            }
+        }
     }
 }
 
