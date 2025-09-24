@@ -15,10 +15,11 @@ Self‑contained background workers that compute a “simple” jump‑loss esti
 
 ## Layout
 
-- `jumplossPython.py` — Python CLI tool
-- `jumploss_python_lib.py` — Python library (spawns its own thread + asyncio loop)
+- `jumploss-python/` — Python CLI and library
+  - `jumploss-python/jumplossPython.py` — CLI
+  - `jumploss-python/jumploss_python_lib.py` — library (thread + asyncio)
 - `jumploss-rs/` — Rust crate (library + example binary)
-- `jumploss-go/` — Go module with `jumploss` package and example `main`
+- `jumploss-go/` — Go module (`jumploss` package + CLI)
 
 ## Math & Defaults
 
@@ -37,15 +38,20 @@ Requirements
 - `pip install websockets`
 
 CLI (quick test)
-- `python3 jumplossPython.py 5000`
-  - Prints periodic lines like: `JL(simple,no-clamp): μ_J=…% F=0.050000% JL=…% buckets=N`
+- `python3 jumploss-python/jumplossPython.py 5000`
+  - Prints: `JL(simple,no-clamp): μ_J=…% F=0.050000% JL=…% buckets=N`
+  - Dynamic mode (half‑life = settlement/2):
+    - `python3 jumploss-python/jumplossPython.py 5000 --seconds 12`
+    - `python3 jumploss-python/jumplossPython.py 5000 --blocks 8` (Base 2s/block → HL=8s)
+    - Live change: type `seconds 20` or `blocks 6` then Enter
 
 Library (importable, spawns its own worker)
-- File: `jumploss_python_lib.py`
+- File: `jumploss-python/jumploss_python_lib.py`
 - API:
-  - `JumpLossWorker(fee_units: int, on_update: Optional[callable] = None, bucket_ms: int = 160, half_life_ms: int = 4800)`
+  - `JumpLossWorker(fee_units, on_update=None, bucket_ms=160, half_life_ms=4800)`
   - Methods: `start_background()`, `stop()`
   - Thread‑safe queue: `worker.updates` yields `JumpLossUpdate(timestamp, mu_j_percent, jl_percent, f_percent, bucket_count)`
+  - On‑demand dynamic JL: `request_jumploss(fee_units, settlement_time, time_type_seconds)`
 
 Example
 ```python
@@ -55,12 +61,7 @@ from jumploss_python_lib import JumpLossWorker
 def on_update(u):
     print(f"JL={u.jl_percent:.6f}%  muJ={u.mu_j_percent:.6f}%  buckets={u.bucket_count}")
 
-worker = JumpLossWorker(
-    fee_units=5000,           # F = 0.05%
-    on_update=on_update,
-    bucket_ms=160,            # optional
-    half_life_ms=4800         # optional
-)
+worker = JumpLossWorker(fee_units=5000, on_update=on_update)
 worker.start_background()
 try:
     time.sleep(15)
@@ -77,6 +78,10 @@ Requirements
 
 CLI (quick test)
 - `cd jumploss-rs && cargo run --release -- 5000`
+  - Dynamic mode (half‑life = settlement/2):
+    - `cargo run -p jumploss-rs --release -- 5000 --seconds 12`
+    - `cargo run -p jumploss-rs --release -- 5000 --blocks 8` (Base 2s/block → HL=8s)
+    - Live change: type `seconds 20` or `blocks 6` then Enter
 
 Library
 - Add a path dependency from your Rust project (example `Cargo.toml`):
@@ -85,9 +90,9 @@ Library
 jumploss-rs = { path = "../jumploss-rs" }
 ```
 - API:
-  - `start_background(fee_units: i64) -> JumpLossHandle` (uses defaults)
-  - `start_with_config(fee_units: i64, Config { bucket_ms, half_life_ms }) -> JumpLossHandle`
-  - `JumpLossHandle { updates: mpsc::Receiver<JumpLossUpdate>, shutdown: watch::Sender<bool> }`
+  - `start_background(fee_units) -> JumpLossHandle`
+  - `start_with_config(fee_units, Config { bucket_ms, half_life_ms }) -> JumpLossHandle`
+  - `JumpLossHandle { updates, shutdown, request_jumploss(...) }`
   - `JumpLossUpdate { timestamp_ms, mu_j_percent, jl_percent, f_percent, bucket_count }`
 
 Example
@@ -114,6 +119,10 @@ Requirements
 
 CLI (quick test)
 - `cd jumploss-go && go run . 5000`
+  - Dynamic mode (half‑life = settlement/2):
+    - `go run . 5000 --seconds 12`
+    - `go run . 5000 --blocks 8` (Base 2s/block → HL=8s)
+    - Live change: type `seconds 20` or `blocks 6` then Enter
 
 Library
 - Package: `jumploss-go/jumploss`
@@ -137,11 +146,11 @@ func main() {
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    updates, _ := jumploss.StartWithConfig(ctx, 5000, jumploss.Config{BucketMS: 160, HalfLifeMS: 4800})
+    h, _ := jumploss.StartWithConfig(ctx, 5000, jumploss.Config{BucketMS: 160, HalfLifeMS: 4800})
     timeout := time.After(15 * time.Second)
     for {
         select {
-        case u, ok := <-updates:
+        case u, ok := <-h.Updates:
             if !ok { return }
             fmt.Printf("JL=%.6f%% muJ=%.6f%% buckets=%d F=%.6f%%\n", u.JLPercent, u.MuJPercent, u.BucketCount, u.FPercent)
         case <-timeout:
@@ -172,4 +181,3 @@ func main() {
 - Python: ensure `websockets` is installed; verify outbound WS access.
 - Rust: ensure the path dependency points to `jumploss-rs`; run with `--release` for lower CPU.
 - Go: ensure Go ≥ 1.21; if importing the package, use a local `replace` to point to `jumploss-go`.
-
